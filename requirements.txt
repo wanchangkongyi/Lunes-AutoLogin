@@ -1,0 +1,5 @@
+seleniumbase
+pyvirtualdisplay
+requests
+pyautogui
+pillow
