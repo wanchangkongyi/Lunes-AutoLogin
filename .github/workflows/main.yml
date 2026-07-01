@@ -1,1 +1,51 @@
+name: Lunes Auto Login
+on:
+  schedule:
+    - cron: "0 2 */6 * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Install deps
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run login
+        env:
+          ACCOUNTS_BATCH: ${{ secrets.ACCOUNTS_BATCH }}
+        run: python login.py
+
+      - name: Upload screenshots as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-screenshots
+          path: screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Commit timestamp
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          git diff --cached --quiet || (git commit -m "run $(date +'%Y-%m-%d %H:%M')" && git push)
