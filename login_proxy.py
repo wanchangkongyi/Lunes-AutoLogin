@@ -18,21 +18,30 @@ SCREENSHOT_DIR = "screenshots"
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 EMAIL_SEL = "#email"
+PASS_SEL = "#password"
+SUBMIT_SEL = 'button.submit-btn[type="submit"]'
 LOGOUT_SEL = 'a[href="/logout"].action-btn.ghost'
 NOW_MANAGING_XPATH = 'xpath=//p[contains(normalize-space(.), "Now managing")]'
 SERVER_CARD_LINK_SEL = 'a.server-card[href^="/servers/"]'
 
-# 跑完一次后是否退出登录。Cookie 登录模式下退出会让这个 Cookie 失效，
-# 下次还得重新手动复制，所以默认不退出。如果你想保留原来"登出"的行为，
-# 在仓库 Secrets/Variables 里加一个 LOGOUT_AFTER_RUN=1 即可。
-LOGOUT_AFTER_RUN = (os.getenv("LOGOUT_AFTER_RUN") or "").strip() == "1"
+# 代理配置：由 scripts/setup_proxy.sh 在 GitHub Actions 里通过 $GITHUB_ENV 注入，
+# 本地跑的话可以自己 export IS_PROXY=true / PROXY_SERVER=socks5://127.0.0.1:1080
+IS_PROXY = (os.getenv("IS_PROXY") or "false").strip().lower() == "true"
+PROXY_SERVER = (os.getenv("PROXY_SERVER") or "").strip() or "socks5://127.0.0.1:1080"
 
 
-def mask_cookie(cookie_str: str) -> str:
-    s = (cookie_str or "").strip()
-    if len(s) <= 12:
+def mask_email_keep_domain(email: str) -> str:
+    e = (email or "").strip()
+    if "@" not in e:
         return "***"
-    return f"{s[:6]}...{s[-6:]} (len={len(s)})"
+    name, domain = e.split("@", 1)
+    if len(name) <= 1:
+        name_mask = name or "*"
+    elif len(name) == 2:
+        name_mask = name[0] + name[1]
+    else:
+        name_mask = name[0] + ("*" * (len(name) - 2)) + name[-1]
+    return f"{name_mask}@{domain}"
 
 
 def setup_xvfb():
@@ -69,34 +78,18 @@ def tg_send(text: str, token: Optional[str] = None, chat_id: Optional[str] = Non
         print(f"⚠️ TG 发送失败：{e}")
 
 
-def parse_cookie_string(cookie_str: str) -> List[Dict[str, str]]:
-    """把 'name1=value1; name2=value2' 形式的 Cookie 请求头拆成 selenium 需要的 dict 列表。"""
-    cookies = []
-    for part in (cookie_str or "").split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        name = name.strip()
-        value = value.strip()
-        if not name:
-            continue
-        cookies.append({"name": name, "value": value})
-    return cookies
+def get_current_ip(proxy_server: str = "") -> str:
+    """探测当前出口 IP，方便确认代理是否真的生效。"""
+    proxies = {"http": proxy_server, "https": proxy_server} if proxy_server else None
+    try:
+        resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+        resp.raise_for_status()
+        return resp.text.strip()
+    except Exception as e:
+        return f"获取失败：{e}"
 
 
 def build_accounts_from_env() -> List[Dict[str, str]]:
-    """
-    ACCOUNTS_BATCH 每行一个账号，格式：
-
-        cookie字符串
-        cookie字符串||tg_bot_token||tg_chat_id
-
-    cookie字符串就是浏览器里已登录状态下，发往 betadash.lunes.host 的请求头里
-    完整的 Cookie 值（devtools -> Network -> 随便一个请求 -> Request Headers -> Cookie），
-    形如：session=eyJhbGci...; cf_clearance=xxxx
-    用 '||' 而不是逗号分隔 TG 字段，是因为 Cookie 本身可能包含逗号。
-    """
     batch = (os.getenv("ACCOUNTS_BATCH") or "").strip()
     if not batch:
         raise RuntimeError("❌ 缺少环境变量：ACCOUNTS_BATCH")
@@ -107,23 +100,24 @@ def build_accounts_from_env() -> List[Dict[str, str]]:
         if not line or line.startswith("#"):
             continue
 
-        parts = [p.strip() for p in line.split("||")]
+        parts = [p.strip() for p in line.split(",")]
 
-        if len(parts) not in (1, 3):
+        if len(parts) not in (2, 4):
             raise RuntimeError(
-                f"❌ 第 {idx} 行格式不对（必须是 cookie 或 "
-                f"cookie||tg_bot_token||tg_chat_id）：{raw!r}"
+                f"❌ 第 {idx} 行格式不对（必须是 email,password 或 "
+                f"email,password,tg_bot_token,tg_chat_id）：{raw!r}"
             )
 
-        cookie_str = parts[0]
-        tg_token = parts[1] if len(parts) == 3 else ""
-        tg_chat = parts[2] if len(parts) == 3 else ""
+        email, password = parts[0], parts[1]
+        tg_token = parts[2] if len(parts) == 4 else ""
+        tg_chat = parts[3] if len(parts) == 4 else ""
 
-        if not cookie_str or "=" not in cookie_str:
-            raise RuntimeError(f"❌ 第 {idx} 行 cookie 为空或格式不对：{raw!r}")
+        if not email or not password:
+            raise RuntimeError(f"❌ 第 {idx} 行存在空字段：{raw!r}")
 
         accounts.append({
-            "cookie": cookie_str,
+            "email": email,
+            "password": password,
             "tg_token": tg_token,
             "tg_chat": tg_chat,
         })
@@ -205,7 +199,7 @@ def _find_server_id_and_go_server_page(sb: SB) -> Tuple[Optional[str], bool]:
         return server_id, False
 
 
-def _post_login_visit_then_maybe_logout(sb: SB) -> Tuple[Optional[str], bool]:
+def _post_login_visit_then_logout(sb: SB) -> Tuple[Optional[str], bool]:
     server_id, entered_ok = _find_server_id_and_go_server_page(sb)
     if not entered_ok:
         return server_id, False
@@ -226,11 +220,6 @@ def _post_login_visit_then_maybe_logout(sb: SB) -> Tuple[Optional[str], bool]:
     print(f"⏳ 首页停留 {stay2} 秒...")
     time.sleep(stay2)
 
-    if not LOGOUT_AFTER_RUN:
-        # Cookie 登录模式：默认不登出，保留会话，方便下次继续用同一个 cookie。
-        print("ℹ️ 跳过登出（LOGOUT_AFTER_RUN 未开启），保留会话")
-        return server_id, True
-
     # 直接访问 /logout URL
     try:
         print(f"🚪 退出：{LOGOUT_URL}")
@@ -250,31 +239,41 @@ def _post_login_visit_then_maybe_logout(sb: SB) -> Tuple[Optional[str], bool]:
         return server_id, False
 
 
-def login_then_flow_one_account(cookie_str: str) -> Tuple[str, Optional[str], bool, str, Optional[str], bool]:
-    cookies = parse_cookie_string(cookie_str)
-    if not cookies:
-        return "FAIL", None, False, "", None, False
+def login_then_flow_one_account(email: str, password: str) -> Tuple[str, Optional[str], bool, str, Optional[str], bool, str]:
+    sb_kwargs = {"uc": True, "locale": "en", "test": True}
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        sb_kwargs["proxy"] = PROXY_SERVER
+    else:
+        print("🍭 未使用代理，直连访问")
 
-    with SB(uc=True, locale="en", test=True) as sb:
+    exit_ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+    print(f"📍 当前出口 IP: {exit_ip}")
+
+    with SB(**sb_kwargs) as sb:
         print("🚀 浏览器启动（UC Mode）")
-
-        # 必须先打开一次目标域名，才能往这个域名下注入 cookie
-        sb.uc_open_with_reconnect(HOME_URL, reconnect_time=5.0)
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5.0)
         time.sleep(2)
-        _try_click_captcha(sb, "注入 cookie 前")
 
-        print(f"🍪 注入 {len(cookies)} 个 cookie")
-        for c in cookies:
-            try:
-                sb.add_cookie(c)
-            except Exception as e:
-                print(f"⚠️ 添加 cookie {c['name']} 失败：{e}")
+        try:
+            sb.wait_for_element_visible(EMAIL_SEL, timeout=25)
+            sb.wait_for_element_visible(PASS_SEL, timeout=25)
+            sb.wait_for_element_visible(SUBMIT_SEL, timeout=25)
+        except Exception:
+            url_now = sb.get_current_url() or ""
+            screenshot(sb, f"login_form_not_found_{int(time.time())}.png")
+            return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
 
-        # 注入完成后刷新，让登录态生效
-        sb.uc_open_with_reconnect(HOME_URL, reconnect_time=5.0)
+        sb.clear(EMAIL_SEL)
+        sb.type(EMAIL_SEL, email)
+        sb.clear(PASS_SEL)
+        sb.type(PASS_SEL, password)
+
+        _try_click_captcha(sb, "提交前")
+        sb.click(SUBMIT_SEL)
         sb.wait_for_element_visible("body", timeout=30)
         time.sleep(2)
-        _try_click_captcha(sb, "刷新后")
+        _try_click_captcha(sb, "提交后")
 
         has_cf = _has_cf_clearance(sb)
         current_url = (sb.get_current_url() or "").strip()
@@ -289,16 +288,16 @@ def login_then_flow_one_account(cookie_str: str) -> Tuple[str, Optional[str], bo
 
         if not logged_in:
             screenshot(sb, f"login_check_failed_{int(time.time())}.png")
-            return "FAIL", welcome_text, has_cf, current_url, None, False
+            return "FAIL", welcome_text, has_cf, current_url, None, False, exit_ip
 
-        server_id, logout_ok = _post_login_visit_then_maybe_logout(sb)
+        server_id, logout_ok = _post_login_visit_then_logout(sb)
 
         try:
             current_url = (sb.get_current_url() or "").strip()
         except Exception:
             pass
 
-        return "OK", welcome_text, has_cf, current_url, server_id, logout_ok
+        return "OK", welcome_text, has_cf, current_url, server_id, logout_ok, exit_ip
 
 
 def main():
@@ -312,21 +311,22 @@ def main():
 
     try:
         for i, acc in enumerate(accounts, start=1):
-            cookie_str = acc["cookie"]
+            email = acc["email"]
+            password = acc["password"]
             tg_token = (acc.get("tg_token") or "").strip()
             tg_chat = (acc.get("tg_chat") or "").strip()
             if tg_token and tg_chat:
                 tg_dests.add((tg_token, tg_chat))
 
-            safe_cookie = mask_cookie(cookie_str)
+            safe_email = mask_email_keep_domain(email)
 
             print("\n" + "=" * 70)
-            print(f"👤 [{i}/{len(accounts)}] cookie：{safe_cookie}")
+            print(f"👤 [{i}/{len(accounts)}] 账号：{safe_email}")
             print("=" * 70)
 
             try:
-                status, welcome_text, has_cf, url_now, server_id, logout_ok = login_then_flow_one_account(
-                    cookie_str
+                status, welcome_text, has_cf, url_now, server_id, logout_ok, exit_ip = login_then_flow_one_account(
+                    email, password
                 )
 
                 if status == "OK":
@@ -334,23 +334,24 @@ def main():
                     if logout_ok:
                         logout_ok_count += 1
                     msg = (
-                        f"✅ Lunes BetaDash 续期成功（Cookie 登录）\n"
-                        f"cookie：{safe_cookie}\n"
+                        f"✅ Lunes BetaDash 登录成功（代理+账号密码）\n"
+                        f"账号：{safe_email}\n"
+                        f"出口IP：{exit_ip}\n"
                         f"server_id：{server_id or '未提取到'}\n"
                         f"welcome：{welcome_text or '未读取到'}\n"
-                        f"退出：{'✅ 已登出' if LOGOUT_AFTER_RUN else '⏭️ 保留会话'}\n"
+                        f"退出：{'✅ 成功' if logout_ok else '❌ 失败'}\n"
                         f"当前页：{url_now}\n"
                         f"cf_clearance：{'OK' if has_cf else 'NONE'}"
                     )
                 else:
                     fail += 1
                     msg = (
-                        f"❌ Lunes BetaDash 续期失败（Cookie 登录）\n"
-                        f"cookie：{safe_cookie}\n"
+                        f"❌ Lunes BetaDash 登录失败（代理+账号密码）\n"
+                        f"账号：{safe_email}\n"
+                        f"出口IP：{exit_ip}\n"
                         f"welcome：{welcome_text or '未检测到'}\n"
                         f"当前页：{url_now}\n"
-                        f"cf_clearance：{'OK' if has_cf else 'NONE'}\n"
-                        f"⚠️ 大概率是 cookie 已过期，需要重新登录浏览器复制新的 Cookie"
+                        f"cf_clearance：{'OK' if has_cf else 'NONE'}"
                     )
 
                 print(msg)
@@ -358,7 +359,7 @@ def main():
 
             except Exception as e:
                 fail += 1
-                msg = f"❌ Lunes BetaDash 脚本异常\ncookie：{safe_cookie}\n错误：{e}"
+                msg = f"❌ Lunes BetaDash 脚本异常\n账号：{safe_email}\n错误：{e}"
                 print(msg)
                 tg_send(msg, tg_token, tg_chat)
 
@@ -368,7 +369,7 @@ def main():
                 print(f"⏳ 距下一账号等待 {gap} 秒...")
                 time.sleep(gap)
 
-        summary = f"📌 本次批量完成：续期成功 {ok} / 失败 {fail} | 登出 {logout_ok_count}/{ok}"
+        summary = f"📌 本次批量完成：登录成功 {ok} / 失败 {fail} | 退出成功 {logout_ok_count}/{ok}"
         print("\n" + summary)
         for token, chat in sorted(tg_dests):
             tg_send(summary, token, chat)
