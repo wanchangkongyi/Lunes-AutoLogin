@@ -19,7 +19,14 @@ os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 EMAIL_SEL = "#email"
 PASS_SEL = "#password"
-SUBMIT_SEL = 'button.submit-btn[type="submit"]'
+# 提交按钮的文案/样式可能会随验证码通过与否变化（比如从 "Sign in" 变成
+# "Continue to dashboard"），所以做成候选列表，依次尝试。
+SUBMIT_SELECTORS = [
+    'button.submit-btn[type="submit"]',
+    'button:contains("Continue to dashboard")',
+    'button:contains("Sign in")',
+    'button[type="submit"]',
+]
 LOGOUT_SEL = 'a[href="/logout"].action-btn.ghost'
 NOW_MANAGING_XPATH = 'xpath=//p[contains(normalize-space(.), "Now managing")]'
 SERVER_CARD_LINK_SEL = 'a.server-card[href^="/servers/"]'
@@ -138,12 +145,93 @@ def _has_cf_clearance(sb: SB) -> bool:
         return False
 
 
+CF_INDICATORS = ["verify you are human", "确认您是真人", "just a moment", "checking your browser"]
+
+
+def _cf_challenge_present(sb: SB) -> bool:
+    """判断当前页面是否还存在【未通过】的 Cloudflare 验证码。
+
+    UC Mode 很多时候页面一加载验证码就已经自动过了（Turnstile 显示绿色
+    Success!），这种情况下不能再去点验证码——那个坐标位置的内容已经变了
+    （比如变成别的链接），盲点一下反而可能点到别的地方，把表单点坏。
+    """
+    try:
+        src = (sb.get_page_source() or "").lower()
+    except Exception:
+        return False
+
+    if any(x in src for x in CF_INDICATORS):
+        return True
+
+    try:
+        has_iframe = sb.is_element_present('iframe[src*="challenges.cloudflare.com"]')
+    except Exception:
+        has_iframe = False
+
+    if has_iframe and "success" not in src:
+        return True
+
+    return False
+
+
+def _wait_cf_challenge_clear(sb: SB, timeout: int = 20) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if not _cf_challenge_present(sb):
+            return True
+        time.sleep(1)
+    return False
+
+
 def _try_click_captcha(sb: SB, stage: str):
+    if not _cf_challenge_present(sb):
+        print(f"ℹ️ 未检测到需要处理的验证码，跳过点击（{stage}）")
+        return
+    print(f"🔒 检测到未通过的验证码，尝试点击（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
         time.sleep(3)
     except Exception as e:
         print(f"⚠️ captcha 点击异常（{stage}）：{e}")
+    _wait_cf_challenge_clear(sb, timeout=20)
+
+
+def _fill_field_verified(sb: SB, selector: str, value: str, label: str, attempts: int = 3) -> bool:
+    """输入并校验输入框确实有值，避免被验证码刷新/页面重渲染悄悄清空。"""
+    for i in range(1, attempts + 1):
+        try:
+            sb.clear(selector)
+            sb.type(selector, value)
+        except Exception as e:
+            print(f"⚠️ 填写 {label} 失败（第 {i} 次）：{e}")
+            time.sleep(1)
+            continue
+
+        try:
+            current = sb.get_value(selector) or ""
+        except Exception:
+            current = ""
+
+        if current == value:
+            return True
+
+        print(f"⚠️ {label} 填写后校验不一致（第 {i} 次），重试...")
+        time.sleep(1)
+
+    return False
+
+
+def _click_submit(sb: SB) -> bool:
+    for selector in SUBMIT_SELECTORS:
+        try:
+            if sb.is_element_visible(selector):
+                print(f"🖱️ 点击提交按钮：{selector}")
+                sb.click(selector)
+                return True
+        except Exception:
+            continue
+    print("❌ 未找到可点击的提交按钮")
+    return False
 
 
 def _is_logged_in(sb: SB) -> Tuple[bool, Optional[str]]:
@@ -258,21 +346,31 @@ def login_then_flow_one_account(email: str, password: str) -> Tuple[str, Optiona
         try:
             sb.wait_for_element_visible(EMAIL_SEL, timeout=25)
             sb.wait_for_element_visible(PASS_SEL, timeout=25)
-            sb.wait_for_element_visible(SUBMIT_SEL, timeout=25)
         except Exception:
             url_now = sb.get_current_url() or ""
             screenshot(sb, f"login_form_not_found_{int(time.time())}.png")
             return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
 
-        sb.clear(EMAIL_SEL)
-        sb.type(EMAIL_SEL, email)
-        sb.clear(PASS_SEL)
-        sb.type(PASS_SEL, password)
+        # 先处理验证码（如果确实还没通过），再填表单——避免验证码状态变化
+        # （比如自动通过后页面重渲染）把刚填的邮箱密码冲掉
+        _try_click_captcha(sb, "登录前")
 
-        _try_click_captcha(sb, "提交前")
-        sb.click(SUBMIT_SEL)
+        email_ok = _fill_field_verified(sb, EMAIL_SEL, email, "邮箱")
+        pass_ok = _fill_field_verified(sb, PASS_SEL, password, "密码")
+
+        if not (email_ok and pass_ok):
+            url_now = sb.get_current_url() or ""
+            screenshot(sb, f"fill_form_failed_{int(time.time())}.png")
+            return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
+
+        if not _click_submit(sb):
+            url_now = sb.get_current_url() or ""
+            screenshot(sb, f"submit_not_found_{int(time.time())}.png")
+            return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
+
         sb.wait_for_element_visible("body", timeout=30)
         time.sleep(2)
+        # 提交后如果又弹出了新的验证码，再处理一次；已经通过的话会自动跳过
         _try_click_captcha(sb, "提交后")
 
         has_cf = _has_cf_clearance(sb)

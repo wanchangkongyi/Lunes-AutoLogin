@@ -144,7 +144,36 @@ def _has_cf_clearance(sb: SB) -> bool:
         return False
 
 
+CF_INDICATORS = ["verify you are human", "确认您是真人", "just a moment", "checking your browser"]
+
+
+def _cf_challenge_present(sb: SB) -> bool:
+    """判断当前页面是否还存在【未通过】的 Cloudflare 验证码，避免在验证码
+    已经自动通过的情况下继续盲点，误触发页面上其他元素。"""
+    try:
+        src = (sb.get_page_source() or "").lower()
+    except Exception:
+        return False
+
+    if any(x in src for x in CF_INDICATORS):
+        return True
+
+    try:
+        has_iframe = sb.is_element_present('iframe[src*="challenges.cloudflare.com"]')
+    except Exception:
+        has_iframe = False
+
+    if has_iframe and "success" not in src:
+        return True
+
+    return False
+
+
 def _try_click_captcha(sb: SB, stage: str):
+    if not _cf_challenge_present(sb):
+        print(f"ℹ️ 未检测到需要处理的验证码，跳过点击（{stage}）")
+        return
+    print(f"🔒 检测到未通过的验证码，尝试点击（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
         time.sleep(3)
