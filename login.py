@@ -144,55 +144,14 @@ def _has_cf_clearance(sb: SB) -> bool:
         return False
 
 
-CF_TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"]'
-TURNSTILE_RESPONSE_SEL = 'input[name="cf-turnstile-response"]'
-
-
-def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
-    """等 Turnstile 的 iframe 真正渲染出来再动手，避免验证码组件还没加载
-    完就被误判成'不存在'而漏点。"""
-    try:
-        sb.wait_for_element_present(CF_TURNSTILE_IFRAME_SEL, timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
-def _turnstile_token_present(sb: SB) -> bool:
-    try:
-        val = sb.get_attribute(TURNSTILE_RESPONSE_SEL, "value") or ""
-        return len(val.strip()) > 0
-    except Exception:
-        return False
-
-
-def _wait_turnstile_verified(sb: SB, timeout: int = 15) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        if _turnstile_token_present(sb):
-            return True
-        time.sleep(1)
-    return False
-
-
 def _try_click_captcha(sb: SB, stage: str):
-    """挂了代理之后 Cloudflare 大多会自动验证通过，不需要真的去点。
-    先等（轮询 `cf-turnstile-response` 这个 hidden input 是否已经被写入
-    token，这是唯一能从主文档可靠判断验证是否通过的信号），超时还没过
-    才点一次兜底。"""
-    print(f"⏳ 等待验证码自动通过（{stage}）...")
-    if _wait_turnstile_verified(sb, timeout=15):
-        print(f"✅ 验证码已自动通过（{stage}）")
-        return
-
-    if not _wait_turnstile_rendered(sb, timeout=8):
-        print(f"ℹ️ 未检测到验证码 iframe（{stage}），可能本次不需要验证")
-        return
-
-    print(f"🔒 自动验证未通过，尝试点击一次兜底（{stage}）...")
+    """最原始也最有效的做法：无条件点一次，不做任何"是否已经通过"的
+    猜测判断，也不重复点——重复触发交互式验证码本身就可能把已经成功的
+    状态弄坏，之前几版加的各种检测/轮询都不可靠，干脆都去掉。"""
+    print(f"🔒 点击验证码（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
-        time.sleep(3)
+        time.sleep(5)
     except Exception as e:
         print(f"⚠️ captcha 点击异常（{stage}）：{e}")
 
