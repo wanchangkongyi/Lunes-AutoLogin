@@ -145,6 +145,7 @@ def _has_cf_clearance(sb: SB) -> bool:
 
 
 CF_TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"]'
+TURNSTILE_RESPONSE_SEL = 'input[name="cf-turnstile-response"]'
 
 
 def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
@@ -157,15 +158,38 @@ def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
         return False
 
 
+def _turnstile_token_present(sb: SB) -> bool:
+    try:
+        val = sb.get_attribute(TURNSTILE_RESPONSE_SEL, "value") or ""
+        return len(val.strip()) > 0
+    except Exception:
+        return False
+
+
+def _wait_turnstile_verified(sb: SB, timeout: int = 15) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _turnstile_token_present(sb):
+            return True
+        time.sleep(1)
+    return False
+
+
 def _try_click_captcha(sb: SB, stage: str):
-    """尝试点一次验证码。Turnstile 挂在跨域 iframe 里，主文档读不到它内部
-    是否已经验证通过，所以不做'是否需要点'的猜测判断——只要 iframe 渲染
-    出来了就点一下；Cookie 登录流程里这一步不涉及表单填写，就算没点准
-    也没有内容可丢，比强行判断"是否已解决"更稳。"""
-    if not _wait_turnstile_rendered(sb, timeout=12):
+    """挂了代理之后 Cloudflare 大多会自动验证通过，不需要真的去点。
+    先等（轮询 `cf-turnstile-response` 这个 hidden input 是否已经被写入
+    token，这是唯一能从主文档可靠判断验证是否通过的信号），超时还没过
+    才点一次兜底。"""
+    print(f"⏳ 等待验证码自动通过（{stage}）...")
+    if _wait_turnstile_verified(sb, timeout=15):
+        print(f"✅ 验证码已自动通过（{stage}）")
+        return
+
+    if not _wait_turnstile_rendered(sb, timeout=8):
         print(f"ℹ️ 未检测到验证码 iframe（{stage}），可能本次不需要验证")
         return
-    print(f"🔒 尝试点击验证码（{stage}）...")
+
+    print(f"🔒 自动验证未通过，尝试点击一次兜底（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
         time.sleep(3)

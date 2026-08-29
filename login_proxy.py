@@ -146,6 +146,10 @@ def _has_cf_clearance(sb: SB) -> bool:
 
 
 CF_TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"]'
+# Turnstile 验证通过后，跨域 iframe 会通过 postMessage 把 token 写进主文档
+# 这个 hidden input 里——这是唯一能从主文档里可靠判断"验证是否真的通过"
+# 的信号，比读页面文字/猜 iframe 状态准得多。
+TURNSTILE_RESPONSE_SEL = 'input[name="cf-turnstile-response"]'
 
 
 def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
@@ -158,23 +162,47 @@ def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
         return False
 
 
-def _solve_captcha(sb: SB, stage: str):
-    """尝试点一次验证码。
+def _turnstile_token_present(sb: SB) -> bool:
+    try:
+        val = sb.get_attribute(TURNSTILE_RESPONSE_SEL, "value") or ""
+        return len(val.strip()) > 0
+    except Exception:
+        return False
 
-    Turnstile 挂在跨域 iframe 里，主文档的 get_page_source() 读不到它内部
-    是否已经打勾/显示 Success，所以不再依赖文字匹配去判断"要不要点"——
-    只要 iframe 渲染出来了就点一下（这一步固定放在填表单之前，就算没点
-    准，此时表单还是空的，也不会像'填完表单后再点'那样把已填内容冲掉）。
+
+def _wait_turnstile_verified(sb: SB, timeout: int = 15) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        if _turnstile_token_present(sb):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _solve_captcha(sb: SB, stage: str):
+    """挂了代理之后 Cloudflare 大多会自动验证通过，不需要真的去点。
+    所以先等一等看它是否自动过了（轮询 token 是否已经写入），只有等
+    超时还没通过，才尝试点一次兜底——这一步固定放在填表单之前，就算
+    没点准，此时表单还是空的，也不会把已填内容冲掉。
     """
-    if not _wait_turnstile_rendered(sb, timeout=12):
+    print(f"⏳ 等待验证码自动通过（{stage}）...")
+    if _wait_turnstile_verified(sb, timeout=15):
+        print(f"✅ 验证码已自动通过（{stage}）")
+        return
+
+    if not _wait_turnstile_rendered(sb, timeout=8):
         print(f"ℹ️ 未检测到验证码 iframe（{stage}），可能本次不需要验证")
         return
-    print(f"🔒 尝试点击验证码（{stage}）...")
+
+    print(f"🔒 自动验证未通过，尝试点击一次兜底（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
     except Exception as e:
         print(f"⚠️ captcha 点击异常（{stage}）：{e}")
-    time.sleep(4)
+    if _wait_turnstile_verified(sb, timeout=15):
+        print(f"✅ 点击后验证码已通过（{stage}）")
+    else:
+        print(f"⚠️ 点击后仍未检测到验证码通过（{stage}），继续往下走，看提交结果")
 
 
 def _fill_field_verified(sb: SB, selector: str, value: str, label: str, attempts: int = 3) -> bool:
