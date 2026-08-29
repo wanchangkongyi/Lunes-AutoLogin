@@ -28,6 +28,7 @@ jobs:
       - name: Run login
         env:
           ACCOUNTS_BATCH: ${{ secrets.ACCOUNTS_BATCH }}
+          LOGOUT_AFTER_RUN: ${{ vars.LOGOUT_AFTER_RUN }}
         run: python login.py
 
       - name: Upload screenshots as Artifact
