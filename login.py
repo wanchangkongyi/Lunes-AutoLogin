@@ -144,36 +144,28 @@ def _has_cf_clearance(sb: SB) -> bool:
         return False
 
 
-CF_INDICATORS = ["verify you are human", "确认您是真人", "just a moment", "checking your browser"]
+CF_TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"]'
 
 
-def _cf_challenge_present(sb: SB) -> bool:
-    """判断当前页面是否还存在【未通过】的 Cloudflare 验证码，避免在验证码
-    已经自动通过的情况下继续盲点，误触发页面上其他元素。"""
+def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
+    """等 Turnstile 的 iframe 真正渲染出来再动手，避免验证码组件还没加载
+    完就被误判成'不存在'而漏点。"""
     try:
-        src = (sb.get_page_source() or "").lower()
+        sb.wait_for_element_present(CF_TURNSTILE_IFRAME_SEL, timeout=timeout)
+        return True
     except Exception:
         return False
 
-    if any(x in src for x in CF_INDICATORS):
-        return True
-
-    try:
-        has_iframe = sb.is_element_present('iframe[src*="challenges.cloudflare.com"]')
-    except Exception:
-        has_iframe = False
-
-    if has_iframe and "success" not in src:
-        return True
-
-    return False
-
 
 def _try_click_captcha(sb: SB, stage: str):
-    if not _cf_challenge_present(sb):
-        print(f"ℹ️ 未检测到需要处理的验证码，跳过点击（{stage}）")
+    """尝试点一次验证码。Turnstile 挂在跨域 iframe 里，主文档读不到它内部
+    是否已经验证通过，所以不做'是否需要点'的猜测判断——只要 iframe 渲染
+    出来了就点一下；Cookie 登录流程里这一步不涉及表单填写，就算没点准
+    也没有内容可丢，比强行判断"是否已解决"更稳。"""
+    if not _wait_turnstile_rendered(sb, timeout=12):
+        print(f"ℹ️ 未检测到验证码 iframe（{stage}），可能本次不需要验证")
         return
-    print(f"🔒 检测到未通过的验证码，尝试点击（{stage}）...")
+    print(f"🔒 尝试点击验证码（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
         time.sleep(3)

@@ -145,55 +145,36 @@ def _has_cf_clearance(sb: SB) -> bool:
         return False
 
 
-CF_INDICATORS = ["verify you are human", "确认您是真人", "just a moment", "checking your browser"]
+CF_TURNSTILE_IFRAME_SEL = 'iframe[src*="challenges.cloudflare.com"]'
 
 
-def _cf_challenge_present(sb: SB) -> bool:
-    """判断当前页面是否还存在【未通过】的 Cloudflare 验证码。
-
-    UC Mode 很多时候页面一加载验证码就已经自动过了（Turnstile 显示绿色
-    Success!），这种情况下不能再去点验证码——那个坐标位置的内容已经变了
-    （比如变成别的链接），盲点一下反而可能点到别的地方，把表单点坏。
-    """
+def _wait_turnstile_rendered(sb: SB, timeout: int = 12) -> bool:
+    """等 Turnstile 的 iframe 真正渲染出来再动手，避免验证码组件还没加载
+    完就被误判成'不存在'而漏点。"""
     try:
-        src = (sb.get_page_source() or "").lower()
+        sb.wait_for_element_present(CF_TURNSTILE_IFRAME_SEL, timeout=timeout)
+        return True
     except Exception:
         return False
 
-    if any(x in src for x in CF_INDICATORS):
-        return True
 
-    try:
-        has_iframe = sb.is_element_present('iframe[src*="challenges.cloudflare.com"]')
-    except Exception:
-        has_iframe = False
+def _solve_captcha(sb: SB, stage: str):
+    """尝试点一次验证码。
 
-    if has_iframe and "success" not in src:
-        return True
-
-    return False
-
-
-def _wait_cf_challenge_clear(sb: SB, timeout: int = 20) -> bool:
-    start = time.time()
-    while time.time() - start < timeout:
-        if not _cf_challenge_present(sb):
-            return True
-        time.sleep(1)
-    return False
-
-
-def _try_click_captcha(sb: SB, stage: str):
-    if not _cf_challenge_present(sb):
-        print(f"ℹ️ 未检测到需要处理的验证码，跳过点击（{stage}）")
+    Turnstile 挂在跨域 iframe 里，主文档的 get_page_source() 读不到它内部
+    是否已经打勾/显示 Success，所以不再依赖文字匹配去判断"要不要点"——
+    只要 iframe 渲染出来了就点一下（这一步固定放在填表单之前，就算没点
+    准，此时表单还是空的，也不会像'填完表单后再点'那样把已填内容冲掉）。
+    """
+    if not _wait_turnstile_rendered(sb, timeout=12):
+        print(f"ℹ️ 未检测到验证码 iframe（{stage}），可能本次不需要验证")
         return
-    print(f"🔒 检测到未通过的验证码，尝试点击（{stage}）...")
+    print(f"🔒 尝试点击验证码（{stage}）...")
     try:
         sb.uc_gui_click_captcha()
-        time.sleep(3)
     except Exception as e:
         print(f"⚠️ captcha 点击异常（{stage}）：{e}")
-    _wait_cf_challenge_clear(sb, timeout=20)
+    time.sleep(4)
 
 
 def _fill_field_verified(sb: SB, selector: str, value: str, label: str, attempts: int = 3) -> bool:
@@ -327,6 +308,27 @@ def _post_login_visit_then_logout(sb: SB) -> Tuple[Optional[str], bool]:
         return server_id, False
 
 
+def _attempt_form_login(sb: SB, email: str, password: str, attempt_no: int) -> bool:
+    """点验证码 → 填表单 → 提交，一次完整的尝试。"""
+    print(f"\n--- 第 {attempt_no} 次登录尝试 ---")
+    _solve_captcha(sb, f"第{attempt_no}次-登录前")
+
+    email_ok = _fill_field_verified(sb, EMAIL_SEL, email, "邮箱")
+    pass_ok = _fill_field_verified(sb, PASS_SEL, password, "密码")
+
+    if not (email_ok and pass_ok):
+        screenshot(sb, f"fill_form_failed_attempt{attempt_no}_{int(time.time())}.png")
+        return False
+
+    if not _click_submit(sb):
+        screenshot(sb, f"submit_not_found_attempt{attempt_no}_{int(time.time())}.png")
+        return False
+
+    sb.wait_for_element_visible("body", timeout=30)
+    time.sleep(3)
+    return True
+
+
 def login_then_flow_one_account(email: str, password: str) -> Tuple[str, Optional[str], bool, str, Optional[str], bool, str]:
     sb_kwargs = {"uc": True, "locale": "en", "test": True}
     if IS_PROXY:
@@ -351,41 +353,51 @@ def login_then_flow_one_account(email: str, password: str) -> Tuple[str, Optiona
             screenshot(sb, f"login_form_not_found_{int(time.time())}.png")
             return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
 
-        # 先处理验证码（如果确实还没通过），再填表单——避免验证码状态变化
-        # （比如自动通过后页面重渲染）把刚填的邮箱密码冲掉
-        _try_click_captcha(sb, "登录前")
-
-        email_ok = _fill_field_verified(sb, EMAIL_SEL, email, "邮箱")
-        pass_ok = _fill_field_verified(sb, PASS_SEL, password, "密码")
-
-        if not (email_ok and pass_ok):
-            url_now = sb.get_current_url() or ""
-            screenshot(sb, f"fill_form_failed_{int(time.time())}.png")
-            return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
-
-        if not _click_submit(sb):
-            url_now = sb.get_current_url() or ""
-            screenshot(sb, f"submit_not_found_{int(time.time())}.png")
-            return "FAIL", None, _has_cf_clearance(sb), url_now, None, False, exit_ip
-
-        sb.wait_for_element_visible("body", timeout=30)
-        time.sleep(2)
-        # 提交后如果又弹出了新的验证码，再处理一次；已经通过的话会自动跳过
-        _try_click_captcha(sb, "提交后")
-
-        has_cf = _has_cf_clearance(sb)
-        current_url = (sb.get_current_url() or "").strip()
-
         welcome_text = None
         logged_in = False
-        for _ in range(10):
-            logged_in, welcome_text = _is_logged_in(sb)
+        has_cf = False
+        current_url = ""
+
+        # 提交表单失败一次不直接判死刑，Turnstile 本身就有一定几率没点中/
+        # 没验证成功，再完整走一遍"点验证码→填表单→提交"通常就能过。
+        max_attempts = 2
+        for attempt_no in range(1, max_attempts + 1):
+            if not _attempt_form_login(sb, email, password, attempt_no):
+                current_url = sb.get_current_url() or ""
+                has_cf = _has_cf_clearance(sb)
+                continue
+
+            has_cf = _has_cf_clearance(sb)
+            current_url = (sb.get_current_url() or "").strip()
+
+            for _ in range(10):
+                logged_in, welcome_text = _is_logged_in(sb)
+                if logged_in:
+                    break
+                time.sleep(1)
+
             if logged_in:
                 break
-            time.sleep(1)
+
+            print(f"⚠️ 第 {attempt_no} 次登录后未检测到已登录状态，当前页：{current_url}")
+            screenshot(sb, f"login_check_failed_attempt{attempt_no}_{int(time.time())}.png")
+
+            # 如果已经跳出登录页（比如进了 dashboard 但检测条件没命中），
+            # 就不要再重新提交表单了，避免重复操作已登录状态下的页面。
+            if "/login" not in current_url:
+                break
+
+            # 还停在登录页，说明确实没登录成功，回到登录页重新走一遍再试
+            if attempt_no < max_attempts:
+                sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5.0)
+                time.sleep(2)
+                try:
+                    sb.wait_for_element_visible(EMAIL_SEL, timeout=25)
+                    sb.wait_for_element_visible(PASS_SEL, timeout=25)
+                except Exception:
+                    break
 
         if not logged_in:
-            screenshot(sb, f"login_check_failed_{int(time.time())}.png")
             return "FAIL", welcome_text, has_cf, current_url, None, False, exit_ip
 
         server_id, logout_ok = _post_login_visit_then_logout(sb)
